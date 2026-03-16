@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+
+# Mercury data (ingested PDFs + embeddings — not for source control)
+mercury_data/
+
+# Local test/sample PDFs
+data/
+
+# Generated output
+grounded_page_*.png
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
