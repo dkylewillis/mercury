@@ -1,0 +1,6 @@
+docling>=2.78.0
+docling-core>=2.69.0
+pypdfium2>=5.6.0
+chromadb>=1.5.5
+sentence-transformers>=5.3.0
+pydantic>=2.12.5

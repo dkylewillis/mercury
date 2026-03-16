@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import List, Optional, Union
 
 import chromadb
-from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+from sentence_transformers import SentenceTransformer
 
 from models import BoundingBox, Chunk, QueryResult
 
@@ -28,7 +28,7 @@ class VectorStore:
         persist_path.mkdir(parents=True, exist_ok=True)
 
         self.client = chromadb.PersistentClient(path=str(persist_path))
-        self.embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
+        self.embeddings = SentenceTransformer(embedding_model)
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
             metadata={"hnsw:space": "cosine"},
@@ -85,7 +85,7 @@ class VectorStore:
             return
 
         texts = [c.text for c in chunks]
-        embeddings = self.embeddings.embed_documents(texts)
+        embeddings = self.embeddings.encode(texts).tolist()
         self.collection.upsert(
             ids=[c.id for c in chunks],
             embeddings=embeddings,
@@ -151,7 +151,7 @@ class VectorStore:
             return []
 
         n_results = min(top_k, total)
-        query_embedding = self.embeddings.embed_query(query_text)
+        query_embedding = self.embeddings.encode(query_text).tolist()
 
         if file_hash is None:
             where = None
