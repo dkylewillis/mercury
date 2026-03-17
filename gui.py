@@ -243,6 +243,7 @@ class MercuryGUI(tk.Tk):
         self.doc_tree.column("hash", width=140, minwidth=80)
         self.doc_tree.grid(row=0, column=0, sticky="nsew")
         self.doc_tree.bind("<Button-1>", self._on_tree_click)
+        self.doc_tree.bind("<Double-Button-1>", self._on_tree_double_click)
 
         scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.doc_tree.yview)
         scroll.grid(row=0, column=1, sticky="ns")
@@ -481,6 +482,69 @@ class MercuryGUI(tk.Tk):
         for r in self._all_records:
             self._checked[r.file_hash] = False
         self._apply_filter()
+
+    # ----- Rename ---------------------------------------------------------
+
+    def _on_tree_double_click(self, event):
+        """Open an inline rename dialog when double-clicking the name column."""
+        region = self.doc_tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        col = self.doc_tree.identify_column(event.x)
+        item = self.doc_tree.identify_row(event.y)
+        if not item or col != "#1":  # only the name column
+            return
+
+        current_name = self.doc_tree.item(item, "values")[0]
+        self._show_rename_dialog(item, current_name)
+
+    def _show_rename_dialog(self, file_hash: str, current_name: str):
+        dlg = tk.Toplevel(self)
+        dlg.title("Rename Document")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="New name:", padding=(12, 10, 12, 2)).pack(anchor="w")
+        name_var = tk.StringVar(value=current_name)
+        entry = ttk.Entry(dlg, textvariable=name_var, width=45)
+        entry.pack(padx=12, pady=(0, 8))
+        entry.select_range(0, "end")
+        entry.focus_set()
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(padx=12, pady=(0, 10), fill="x")
+
+        def _confirm():
+            new_name = name_var.get().strip()
+            if not new_name:
+                messagebox.showwarning("Invalid Name", "Name cannot be empty.", parent=dlg)
+                return
+            dlg.destroy()
+            self._set_status("Renaming\u2026")
+            self._run_in_thread(self._rename_worker, file_hash, new_name)
+
+        ttk.Button(btn_row, text="Rename", command=_confirm).pack(side="right", padx=(4, 0))
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="right")
+        entry.bind("<Return>", lambda _: _confirm())
+        entry.bind("<Escape>", lambda _: dlg.destroy())
+
+        # Centre over parent
+        self.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - dlg.winfo_reqwidth()) // 2
+        y = self.winfo_y() + (self.winfo_height() - dlg.winfo_reqheight()) // 2
+        dlg.geometry(f"+{x}+{y}")
+
+    def _rename_worker(self, file_hash: str, new_name: str):
+        try:
+            self.doc_store.rename(file_hash, new_name)
+            self.vector_store.rename_document(file_hash, new_name)
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror("Rename Error", str(e)))
+            self.after(0, lambda: self._set_status("Rename failed"))
+            return
+        self.after(0, self._refresh_docs)
+        self.after(0, lambda: self._set_status(f"Renamed to \"{new_name}\""))
 
     # ----- Delete ---------------------------------------------------------
 

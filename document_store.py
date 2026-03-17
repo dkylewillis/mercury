@@ -129,3 +129,11 @@ class DocumentStore:
             for v in manifest.values()
             if v.get("status", "complete") != "complete"
         ]
+
+    def rename(self, file_hash: str, new_name: str) -> None:
+        """Update the document_name field of a manifest entry."""
+        manifest = self._read_manifest()
+        if file_hash not in manifest:
+            raise KeyError(f"No manifest entry for hash: {file_hash}")
+        manifest[file_hash]["document_name"] = new_name
+        self._write_manifest(manifest)

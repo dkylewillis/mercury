@@ -221,3 +221,26 @@ class VectorStore:
             return
         self.delete(chunks[0].file_hash)
         self.create(chunks)
+
+    def rename_document(self, file_hash: str, new_name: str) -> None:
+        """Update the document_name metadata on all chunks for a document.
+
+        No re-embedding required — only the stored metadata field changes.
+
+        Args:
+            file_hash: The document to rename.
+            new_name: The new display name.
+        """
+        results = self.collection.get(where={"file_hash": {"$eq": file_hash}},
+                                      include=["metadatas", "documents", "embeddings"])
+        if not results["ids"]:
+            return
+        updated_metas = [
+            {**m, "document_name": new_name} for m in results["metadatas"]
+        ]
+        self.collection.update(
+            ids=results["ids"],
+            embeddings=results["embeddings"],
+            documents=results["documents"],
+            metadatas=updated_metas,
+        )
