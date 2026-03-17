@@ -48,6 +48,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from agents import expand_query, answer_question
 from chunker import Chunker
 from converter import Converter
 from document_store import DocumentStore
@@ -93,14 +94,19 @@ def _stores(args: argparse.Namespace):
 def cmd_ingest(args: argparse.Namespace) -> None:
     if not Path(args.file).exists():
         _err(f"File not found: {args.file}", "not_found")
+
+    converter = Converter()
+    doc_store, vs = _stores(args)
+
+    if args.chunk_size > 0:
+        _cmd_ingest_chunked(args, converter, doc_store, vs)
+        return
+
     _progress({"status": "converting", "file": args.file})
     try:
-        converter = Converter()
         dl_doc = converter.convert(args.file)
     except Exception as e:
         _err(f"Conversion failed: {e}", "conversion_failed")
-
-    doc_store, vs = _stores(args)
 
     file_hash = str(dl_doc.origin.binary_hash)
     if doc_store.exists(file_hash):
@@ -143,6 +149,126 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         "filename": dl_doc.origin.filename,
         "page_count": len(dl_doc.pages),
         "chunk_count": len(chunks),
+    })
+
+
+def _cmd_ingest_chunked(
+    args: argparse.Namespace,
+    converter: Converter,
+    doc_store: DocumentStore,
+    vs: VectorStore,
+) -> None:
+    """Ingest a PDF by converting it in sequential page-range chunks.
+
+    Each chunk is converted, chunked, and embedded independently so that peak
+    memory never exceeds what a single page range requires.  Chunk indices are
+    renumbered globally so that window-based context retrieval works correctly
+    across range boundaries.
+    """
+    total_pages = converter.page_count(args.file)
+    chunk_size = args.chunk_size
+    ranges = [
+        (start, min(start + chunk_size - 1, total_pages))
+        for start in range(1, total_pages + 1, chunk_size)
+    ]
+    total_ranges = len(ranges)
+
+    # Convert the first range to obtain document identity before storing.
+    start, end = ranges[0]
+    _progress({
+        "status": "converting",
+        "file": args.file,
+        "page_range": f"{start}-{end}",
+        "range_index": 1,
+        "total_ranges": total_ranges,
+        "total_pages": total_pages,
+    })
+    try:
+        first_dl_doc = converter.convert_page_range(args.file, start, end)
+    except Exception as e:
+        _err(f"Conversion failed on pages {start}-{end}: {e}", "conversion_failed")
+
+    file_hash = str(first_dl_doc.origin.binary_hash)
+    if doc_store.exists(file_hash):
+        _ok({
+            "status": "already_ingested",
+            "collection": args.collection,
+            "file_hash": file_hash,
+            "document_name": first_dl_doc.name,
+            "filename": first_dl_doc.origin.filename,
+        })
+        return
+
+    _progress({"status": "storing", "file_hash": file_hash, "page_count": total_pages})
+    try:
+        file_hash = doc_store.create(
+            first_dl_doc, source_pdf_path=args.file, page_count=total_pages
+        )
+    except Exception as e:
+        _err(f"Document store failed: {e}", "store_failed")
+
+    chunk_offset = 0
+    total_chunks = 0
+    for i, (start, end) in enumerate(ranges):
+        dl_doc = first_dl_doc if i == 0 else None
+        if dl_doc is None:
+            _progress({
+                "status": "converting",
+                "file": args.file,
+                "page_range": f"{start}-{end}",
+                "range_index": i + 1,
+                "total_ranges": total_ranges,
+            })
+            try:
+                dl_doc = converter.convert_page_range(args.file, start, end)
+            except Exception as e:
+                doc_store.set_status(file_hash, "failed")
+                _err(f"Conversion failed on pages {start}-{end}: {e}", "conversion_failed")
+
+        _progress({
+            "status": "chunking",
+            "page_range": f"{start}-{end}",
+            "range_index": i + 1,
+            "total_ranges": total_ranges,
+        })
+        try:
+            range_chunks = Chunker(dl_doc).chunk()
+        except Exception as e:
+            doc_store.set_status(file_hash, "failed")
+            _err(f"Chunking failed on pages {start}-{end}: {e}", "chunking_failed")
+
+        # Renumber indices to be globally sequential across all ranges so that
+        # window-based context retrieval works correctly for cross-range queries.
+        for chunk in range_chunks:
+            new_index = chunk_offset + chunk.index
+            chunk.index = new_index
+            chunk.id = f"{file_hash}_{new_index}"
+
+        _progress({
+            "status": "embedding",
+            "page_range": f"{start}-{end}",
+            "range_index": i + 1,
+            "total_ranges": total_ranges,
+            "chunk_count": len(range_chunks),
+        })
+        try:
+            vs.create(range_chunks)
+        except Exception as e:
+            doc_store.set_status(file_hash, "failed")
+            _err(f"Embedding failed on pages {start}-{end}: {e}", "embedding_failed")
+
+        chunk_offset += len(range_chunks)
+        total_chunks += len(range_chunks)
+
+    doc_store.set_status(file_hash, "complete")
+    _ok({
+        "status": "ingested",
+        "collection": args.collection,
+        "file_hash": file_hash,
+        "document_name": first_dl_doc.name,
+        "filename": first_dl_doc.origin.filename,
+        "page_count": total_pages,
+        "chunk_count": total_chunks,
     })
 
 
@@ -279,9 +405,17 @@ def cmd_repair(args: argparse.Namespace) -> None:
             continue
         try:
             converter = Converter()
-            dl_doc = converter.convert(str(pdf_path))
-            chunks = Chunker(dl_doc).chunk()
-            vs.update(chunks)
+            pdf_str = str(pdf_path)
+            chunk_size = getattr(args, "chunk_size", 50)
+            all_chunks: list = []
+            chunk_offset = 0
+            for _s, _e, doc in converter.convert_in_page_chunks(pdf_str, chunk_size):
+                for chunk in Chunker(doc).chunk():
+                    chunk.index = chunk_offset
+                    chunk.id = f"{record.file_hash}_{chunk_offset}"
+                    all_chunks.append(chunk)
+                    chunk_offset += 1
+            vs.update(all_chunks)
             doc_store.set_status(record.file_hash, "complete")
             fixed.append({"file_hash": record.file_hash, "document_name": record.document_name})
         except Exception as e:
@@ -289,6 +423,70 @@ def cmd_repair(args: argparse.Namespace) -> None:
             failed.append({"file_hash": record.file_hash, "reason": str(e)})
 
     _ok({"fixed": fixed, "failed": failed, **issues})
+
+
+def _resolve_name_filter(args, doc_store):
+    """Resolve --name to a file_hash filter (None, str, or list)."""
+    if not args.name:
+        return None
+    needle = args.name.lower()
+    matched = [
+        r.file_hash for r in doc_store.list()
+        if needle in r.document_name.lower() or needle in r.filename.lower()
+    ]
+    if not matched:
+        _err(f"No documents found matching name: {args.name}", "not_found")
+    return matched[0] if len(matched) == 1 else matched
+
+
+def cmd_ask(args: argparse.Namespace) -> None:
+    doc_store, vs = _stores(args)
+    file_hash = _resolve_name_filter(args, doc_store)
+
+    _progress({"status": "expanding_query", "question": args.question})
+    try:
+        keyphrases = expand_query(args.question)
+    except Exception as e:
+        _err(f"Query expansion failed: {e}", "query_expansion_failed")
+
+    _progress({"status": "searching", "expanded_query": keyphrases})
+    try:
+        results = vs.query(
+            query_text=keyphrases,
+            top_k=args.top_k,
+            file_hash=file_hash,
+            window=args.window,
+        )
+    except Exception as e:
+        _err(f"Query failed: {e}", "query_failed")
+
+    if not results:
+        _ok({
+            "answer": "No relevant documents were found for your question.",
+            "expanded_query": keyphrases,
+            "sources": [],
+        })
+        return
+
+    _progress({"status": "answering", "result_count": len(results)})
+    try:
+        answer = answer_question(args.question, results)
+    except Exception as e:
+        _err(f"Answer generation failed: {e}", "answer_failed")
+
+    sources = []
+    for r in results:
+        sources.append({
+            "document": r.chunk.document_name,
+            "page": r.chunk.page_number,
+            "file_hash": r.chunk.file_hash,
+        })
+
+    _ok({
+        "answer": answer,
+        "expanded_query": keyphrases,
+        "sources": sources,
+    })
 
 
 def cmd_delete(args: argparse.Namespace) -> None:
@@ -326,6 +524,11 @@ def build_parser() -> argparse.ArgumentParser:
     # ingest
     p_ingest = sub.add_parser("ingest", help="Convert, store, chunk, and embed a PDF.")
     p_ingest.add_argument("file", help="Path to the PDF file.")
+    p_ingest.add_argument(
+        "--chunk-size", type=int, default=50, dest="chunk_size", metavar="N",
+        help="Pages per conversion chunk (default: 50). "
+             "Set to 0 to convert the whole document at once.",
+    )
 
     # query
     p_query = sub.add_parser("query", help="Semantic search over ingested documents.")
@@ -354,6 +557,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_repair.add_argument("--fix", action="store_true",
                           help="Re-ingest each incomplete or missing document from its stored PDF.")
 
+    # ask
+    p_ask = sub.add_parser("ask", help="Ask a question: expand query, search, and answer.")
+    p_ask.add_argument("question", help="Natural-language question.")
+    p_ask.add_argument("--top-k", type=int, default=5, metavar="N",
+                       help="Maximum number of search results (default: 5).")
+    p_ask.add_argument("--window", type=int, default=0, metavar="N",
+                       help="Adjacent chunks to include around each hit (default: 0).")
+    p_ask.add_argument("--name", metavar="SUBSTR",
+                       help="Restrict to documents whose name contains this substring.")
+
     # delete
     p_delete = sub.add_parser("delete", help="Remove a document from all stores.")
     p_delete.add_argument("file_hash", help="The binary_hash of the document to remove.")
@@ -368,6 +581,7 @@ def main() -> None:
     dispatch = {
         "ingest": cmd_ingest,
         "query": cmd_query,
+        "ask": cmd_ask,
         "list": cmd_list,
         "status": cmd_status,
         "repair": cmd_repair,

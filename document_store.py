@@ -2,7 +2,7 @@ import json
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 from docling_core.types.doc.document import DoclingDocument
 
@@ -45,12 +45,15 @@ class DocumentStore:
     # CRUD
     # ------------------------------------------------------------------
 
-    def create(self, dl_doc: DoclingDocument, source_pdf_path: str) -> str:
+    def create(self, dl_doc: DoclingDocument, source_pdf_path: str, page_count: Optional[int] = None) -> str:
         """Copy the source PDF into the store and write a pending manifest entry.
 
         Args:
             dl_doc: Converted DoclingDocument (must have a valid ``origin``).
             source_pdf_path: Path to the original PDF to copy into the store.
+            page_count: Total page count to record. When omitted the page count
+                is derived from ``dl_doc.pages``, which may be a subset when
+                the document was converted in chunks.
 
         Returns:
             The ``binary_hash`` used as the storage key.
@@ -66,7 +69,7 @@ class DocumentStore:
             document_name=dl_doc.name,
             filename=filename,
             file_extension=Path(filename).suffix if filename else "",
-            page_count=len(dl_doc.pages),
+            page_count=page_count if page_count is not None else len(dl_doc.pages),
             ingested_at=datetime.now(timezone.utc),
             status="pending",
             pdf_path=str(dest),

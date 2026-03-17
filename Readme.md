@@ -49,7 +49,13 @@ mercury_data/
 ```python
 Converter()
   .convert(source: str) -> DoclingDocument
+  .convert_page_range(source: str, start_page: int, end_page: int) -> DoclingDocument
+  .convert_in_page_chunks(source: str, chunk_size: int) -> Generator[(start, end, DoclingDocument)]
+  .page_count(source: str) -> int                        # static; fast pypdfium2 read, no ML
 ```
+
+Use `convert_page_range` or `convert_in_page_chunks` for large PDFs with memory-spike pages.
+Each page range is converted independently so peak memory is bounded to `chunk_size` pages.
 
 ### `rendering.py`
 
@@ -70,7 +76,7 @@ Chunker(dl_doc: DoclingDocument, tokenizer="sentence-transformers/all-MiniLM-L6-
 
 ```python
 DocumentStore(base_path="./doc_store")
-  .create(dl_doc, source_pdf_path)  -> str               # copies PDF, writes status=pending
+  .create(dl_doc, source_pdf_path, page_count=None) -> str  # copies PDF, writes status=pending
   .set_status(file_hash, status)                          # "pending" | "complete" | "failed"
   .get_pdf_path(file_hash)          -> Path               # path to stored PDF copy
   .exists(file_hash)                -> bool               # True only if status=complete
@@ -106,7 +112,7 @@ COLLECTION = "mercury"
 DOC_STORE  = f"./mercury_data/{COLLECTION}/doc_store"
 CHROMA     = f"./mercury_data/{COLLECTION}/chroma"
 
-# --- Ingest ---
+# --- Ingest (whole document) ---
 converter = Converter()
 dl_doc = converter.convert("report.pdf")
 
@@ -117,6 +123,25 @@ chunks = Chunker(dl_doc).chunk()
 
 vs = VectorStore(collection_name=COLLECTION, persist_directory=CHROMA)
 vs.create(chunks)
+doc_store.set_status(file_hash, "complete")
+
+# --- Ingest (chunked, for large/heavy PDFs) ---
+converter = Converter()
+total_pages = Converter.page_count("report.pdf")
+
+file_hash = doc_store.create(
+    next(doc for _, _, doc in converter.convert_in_page_chunks("report.pdf", chunk_size=50)),
+    source_pdf_path="report.pdf",
+    page_count=total_pages,
+)
+chunk_offset = 0
+for start, end, dl_doc in converter.convert_in_page_chunks("report.pdf", chunk_size=50):
+    range_chunks = Chunker(dl_doc).chunk()
+    for chunk in range_chunks:
+        chunk.index = chunk_offset
+        chunk.id = f"{file_hash}_{chunk_offset}"
+        chunk_offset += 1
+    vs.create(range_chunks)
 doc_store.set_status(file_hash, "complete")
 
 # --- Query (all documents in collection) ---
@@ -180,23 +205,41 @@ $ python cli.py status
 Convert, store, chunk, and embed a PDF. The original PDF is copied into the doc store.
 Re-ingesting the same file (by content hash) returns `already_ingested` immediately.
 
-Emits one progress line per stage before the final result, so agents and terminals get
-live feedback during long conversions:
+By default the PDF is converted in 50-page chunks to bound peak memory (useful for large
+documents with memory-spike pages like dense tables). Pass `--chunk-size 0` to convert the
+whole document at once.
+
+Emits one progress line per stage (and per page-range chunk) before the final result:
 
 ```
+# Default chunked mode (--chunk-size 50)
+{"status": "converting", "file": "data/report.pdf", "page_range": "1-50",   "range_index": 1, "total_ranges": 4, "total_pages": 195}
+{"status": "storing",    "file_hash": "...", "page_count": 195}
+{"status": "converting", "file": "data/report.pdf", "page_range": "51-100",  "range_index": 2, "total_ranges": 4}
+{"status": "chunking",   "page_range": "51-100", "range_index": 2, "total_ranges": 4}
+{"status": "embedding",  "page_range": "51-100", "range_index": 2, "total_ranges": 4, "chunk_count": 38}
+...
+{"status": "ingested",   "collection": "mercury", "file_hash": "...", "page_count": 195, "chunk_count": 312}
+
+# Whole-document mode (--chunk-size 0)
 {"status": "converting",  "file": "data/report.pdf"}
-{"status": "storing",     "file_hash": "...", "page_count": 622}
+{"status": "storing",     "file_hash": "...", "page_count": 9}
 {"status": "chunking"}
-{"status": "embedding",   "chunk_count": 4821}
+{"status": "embedding",   "chunk_count": 50}
 {"status": "ingested",    "collection": "mercury", "file_hash": "...", ...}
 ```
 
 ```
-python cli.py [--data-dir DIR] [--collection NAME] ingest <file>
+python cli.py [--data-dir DIR] [--collection NAME] ingest [--chunk-size N] <file>
 ```
 
 ```
-$ python cli.py ingest data/report.pdf     # already shown above with progress lines
+$ python cli.py ingest data/report.pdf
+# … progress lines as above …
+{"status": "ingested", "collection": "mercury", "file_hash": "11465328351749295394", "page_count": 195, "chunk_count": 312}
+
+$ python cli.py ingest data/report.pdf --chunk-size 100   # 100 pages per conversion pass
+$ python cli.py ingest data/report.pdf --chunk-size 0     # whole document at once
 
 $ python cli.py ingest data/report.pdf
 {"status": "already_ingested", "collection": "mercury", "file_hash": "11465328351749295394", ...}
@@ -292,7 +335,7 @@ $ python cli.py query "tables" --file-hash <hash1> --file-hash <hash2>
 Scan for and optionally fix incomplete ingestions. An ingestion is considered incomplete if its manifest status is `pending`/`failed`, or if it is `complete` in the manifest but has no chunks in ChromaDB.
 
 ```
-python cli.py [--collection NAME] repair [--fix]
+python cli.py [--collection NAME] repair [--fix] [--chunk-size N]
 ```
 
 ```
